@@ -1,0 +1,383 @@
+import { Router } from "express";
+
+import { authenticate, requireRole } from "../middleware/auth.js";
+import { Source } from "../models/source.js";
+import { Station } from "../models/station.js";
+import { Truck } from "../models/truck.js";
+import {
+  fetchStationChangeReport,
+  recordStationAttributeChange
+} from "../services/stationChangeLogService.js";
+
+const router = Router();
+
+const parseNumber = (value) => {
+  if (value === "" || value === null || value === undefined) {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const resolveStationName = (req) => String(req.user?.station || "").trim();
+
+const normalizeStationKey = (value) =>
+  String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+
+const resolveTruckState = (truck) => {
+  const state = String(truck?.state || "").trim();
+  if (
+    state === "atStation" ||
+    state === "atSource" ||
+    state === "atMaintenance" ||
+    state === "travelling"
+  ) {
+    return state;
+  }
+  if (truck?.source) {
+    return "atSource";
+  }
+  return truck?.station ? "atStation" : "travelling";
+};
+
+const resolveMaintenanceStation = (truck) =>
+  String(truck?.maintenance_station || "").trim();
+
+const computeStockUpdate = ({ capacity, deadStock, usable }) => {
+  let nextDead = deadStock;
+  let nextUsable = usable;
+
+  if (deadStock !== null && usable === null) {
+    nextUsable = capacity - deadStock;
+  } else if (usable !== null && deadStock === null) {
+    nextDead = capacity - usable;
+  } else if (deadStock !== null && usable !== null) {
+    nextUsable = capacity - deadStock;
+  }
+
+  return { deadStock: nextDead, usable: nextUsable };
+};
+
+router.use(authenticate);
+router.use(requireRole(["station_manager"]));
+
+router.get("/overview", async (req, res) => {
+  const stationName = resolveStationName(req);
+  if (!stationName) {
+    return res.status(400).json({ message: "Station assignment missing." });
+  }
+
+  try {
+    const station = await Station.findOne({ station: stationName });
+    if (!station) {
+      return res.status(404).json({ message: "Station not found." });
+    }
+    const sourceRows = await Source.find()
+      .sort({ source_id: 1 })
+      .select("source_id source_name coordinates");
+    const sourceOptions = sourceRows.map((source) => ({
+      source_id: source.source_id,
+      source_name: source.source_name,
+      coordinates: source.coordinates || null
+    }));
+    const stationKey = normalizeStationKey(stationName);
+    const allTrucks = await Truck.find().sort({ truck_id: 1 });
+    const matching = allTrucks.filter(
+      (truck) => normalizeStationKey(truck.station) === stationKey
+    );
+
+    const updates = matching
+      .filter(
+        (truck) => truck.station !== stationName || resolveTruckState(truck) !== "atStation"
+      )
+      .map((truck) => ({
+        updateOne: {
+          filter: { _id: truck._id },
+          update: {
+            $set: {
+              station: stationName,
+              state: "atStation",
+              source: null,
+              source_id: null
+            }
+          }
+        }
+      }));
+
+    if (updates.length) {
+      await Truck.bulkWrite(updates);
+      matching.forEach((truck) => {
+        truck.station = stationName;
+        truck.state = "atStation";
+        truck.source = null;
+        truck.source_id = null;
+      });
+    }
+
+    const availableTrucks = allTrucks.filter((truck) => {
+      if (resolveTruckState(truck) === "atStation") {
+        return false;
+      }
+      if (resolveTruckState(truck) !== "atMaintenance") {
+        return true;
+      }
+      const maintStation = resolveMaintenanceStation(truck);
+      return !maintStation || normalizeStationKey(maintStation) === stationKey;
+    });
+
+    return res.json({
+      station,
+      trucks: matching,
+      available_trucks: availableTrucks,
+      sources: sourceOptions
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ message: "Unable to load station overview.", error: error.message });
+  }
+});
+
+router.patch("/station", async (req, res) => {
+  const stationName = resolveStationName(req);
+  if (!stationName) {
+    return res.status(400).json({ message: "Station assignment missing." });
+  }
+
+  try {
+    const station = await Station.findOne({ station: stationName });
+    if (!station) {
+      return res.status(404).json({ message: "Station not found." });
+    }
+
+    const capacity = station.capacity_in_lt;
+    const deadStock = parseNumber(req.body?.dead_stock_in_lt);
+    const usable = parseNumber(req.body?.usable_lt);
+
+    if (deadStock === null && usable === null) {
+      return res
+        .status(400)
+        .json({ message: "Dead stock or usable liters are required." });
+    }
+
+    const computed = computeStockUpdate({ capacity, deadStock, usable });
+    if (computed.deadStock === null || computed.usable === null) {
+      return res
+        .status(400)
+        .json({ message: "Unable to compute stock values." });
+    }
+
+    const sufficientFuel =
+      computed.deadStock >= 0.6 * capacity ? "NO" : "YES";
+
+    const beforeStation = station.toObject();
+    station.dead_stock_in_lt = computed.deadStock;
+    station.usable_lt = computed.usable;
+    station.sufficient_fuel = sufficientFuel;
+
+    await station.save();
+    await recordStationAttributeChange({
+      beforeStation,
+      afterStation: station.toObject(),
+      actor: req.user,
+      source: "station_manager_dashboard"
+    });
+    return res.json(station);
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ message: "Unable to update station stock.", error: error.message });
+  }
+});
+
+router.get("/reports/station-changes", async (req, res) => {
+  try {
+    const records = await fetchStationChangeReport({
+      actorUserId: req.user?.sub,
+      actorRole: "station_manager",
+      preset: req.query.preset,
+      from: req.query.from,
+      to: req.query.to,
+      limit: 2000
+    });
+    return res.json({
+      count: records.length,
+      records
+    });
+  } catch (error) {
+    if (String(error?.message || "").toLowerCase().includes("date")) {
+      return res.status(400).json({ message: error.message });
+    }
+    return res
+      .status(500)
+      .json({ message: "Unable to fetch station change report.", error: error.message });
+  }
+});
+
+router.post("/trucks", async (req, res) => {
+  const stationName = resolveStationName(req);
+  if (!stationName) {
+    return res.status(400).json({ message: "Station assignment missing." });
+  }
+
+  const truckId = String(req.body?.truck_id || "").trim();
+
+  if (!truckId) {
+    return res.status(400).json({ message: "Truck id is required." });
+  }
+
+  try {
+    const station = await Station.findOne({ station: stationName });
+    if (!station) {
+      return res.status(404).json({ message: "Station not found." });
+    }
+
+    const lat = station.coordinates?.lat;
+    const lon = station.coordinates?.lng;
+    const stationKey = normalizeStationKey(stationName);
+
+    const existing = await Truck.findOne({ truck_id: truckId });
+    if (!existing) {
+      return res.status(404).json({ message: "Truck not found." });
+    }
+
+    const currentState = resolveTruckState(existing);
+    const maintenanceStation = resolveMaintenanceStation(existing);
+    if (
+      currentState === "atMaintenance" &&
+      maintenanceStation &&
+      normalizeStationKey(maintenanceStation) !== stationKey
+    ) {
+      return res
+        .status(403)
+        .json({ message: "Truck is in maintenance for another station." });
+    }
+    if (
+      currentState === "atStation" &&
+      normalizeStationKey(existing.station) !== stationKey
+    ) {
+      return res
+        .status(409)
+        .json({ message: "Truck is already parked at another station." });
+    }
+
+    existing.station = stationName;
+    existing.source = null;
+    existing.source_id = null;
+    existing.lat = lat;
+    existing.lon = lon;
+    existing.state = "atStation";
+    existing.maintenance_station = null;
+    await existing.save();
+    return res.json(existing);
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(409).json({ message: "Truck already exists." });
+    }
+    return res
+      .status(500)
+      .json({ message: "Unable to save truck.", error: error.message });
+  }
+});
+
+router.delete("/trucks/:id", async (req, res) => {
+  const stationName = resolveStationName(req);
+  if (!stationName) {
+    return res.status(400).json({ message: "Station assignment missing." });
+  }
+
+  try {
+    const truck = await Truck.findById(req.params.id);
+    if (!truck) {
+      return res.status(404).json({ message: "Truck not found." });
+    }
+    const stationKey = normalizeStationKey(stationName);
+    if (
+      resolveTruckState(truck) !== "atStation" ||
+      normalizeStationKey(truck.station) !== stationKey
+    ) {
+      return res.status(403).json({ message: "Forbidden." });
+    }
+
+    const target = String(req.body?.target || "").trim().toLowerCase();
+    const sourceId = String(req.body?.source_id || req.body?.sourceId || "").trim();
+    const sourceName = String(
+      req.body?.source_name || req.body?.source || ""
+    ).trim();
+    const sendToSource = target === "source" || sourceId || sourceName;
+
+    if (sendToSource) {
+      const source = await Source.findOne(
+        sourceId ? { source_id: sourceId } : { source_name: sourceName }
+      ).select("source_id source_name coordinates");
+
+      if (!source) {
+        return res.status(404).json({ message: "Source not found." });
+      }
+
+      truck.station = null;
+      truck.source = source.source_name;
+      truck.source_id = source.source_id;
+      truck.state = "atSource";
+      truck.maintenance_station = null;
+      truck.lat = source.coordinates?.lat ?? null;
+      truck.lon = source.coordinates?.lng ?? source.coordinates?.lon ?? null;
+      await truck.save();
+      return res.json(truck);
+    }
+
+    truck.station = null;
+    truck.source = null;
+    truck.source_id = null;
+    truck.state = "travelling";
+    truck.maintenance_station = null;
+    await truck.save();
+    return res.json(truck);
+  } catch (error) {
+    if (error?.name === "CastError") {
+      return res.status(400).json({ message: "Invalid truck id." });
+    }
+    return res
+      .status(500)
+      .json({ message: "Unable to remove truck.", error: error.message });
+  }
+});
+
+router.patch("/trucks/:id/maintenance", async (req, res) => {
+  const stationName = resolveStationName(req);
+  if (!stationName) {
+    return res.status(400).json({ message: "Station assignment missing." });
+  }
+
+  try {
+    const truck = await Truck.findById(req.params.id);
+    if (!truck) {
+      return res.status(404).json({ message: "Truck not found." });
+    }
+    const stationKey = normalizeStationKey(stationName);
+    if (
+      resolveTruckState(truck) !== "atStation" ||
+      normalizeStationKey(truck.station) !== stationKey
+    ) {
+      return res.status(403).json({ message: "Forbidden." });
+    }
+    truck.station = null;
+    truck.source = null;
+    truck.source_id = null;
+    truck.state = "atMaintenance";
+    truck.maintenance_station = stationName;
+    await truck.save();
+    return res.json(truck);
+  } catch (error) {
+    if (error?.name === "CastError") {
+      return res.status(400).json({ message: "Invalid truck id." });
+    }
+    return res
+      .status(500)
+      .json({ message: "Unable to update truck state.", error: error.message });
+  }
+});
+
+export default router;
