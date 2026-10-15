@@ -14,6 +14,8 @@ import { ensureAdminUser } from "./services/ensureAdminUser.js";
 import { seedStationManagers } from "./services/seedStationManagers.js";
 import { ensureTruckStates } from "./services/ensureTruckStates.js";
 
+dotenv.config();
+dotenv.config({ path: path.resolve(process.cwd(), ".env") });
 dotenv.config({ path: path.resolve(process.cwd(), "../.env") });
 
 const app = express();
