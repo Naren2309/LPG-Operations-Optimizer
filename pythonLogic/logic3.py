@@ -198,28 +198,32 @@ def transport_cost_loaded_leg(dist_km, carrying_mt):
 
 def transport_cost_rtkm(src_to_stn_km, delivered_mt):
     """
-    SOURCE-TO-SOURCE RTKM billing per delivery stop (company rule).
+    SOURCE-TO-SOURCE RTKM billing per delivery stop (standardized freight rule).
+    Enforces minimum freight floor (₹1,750/MT) so routes just above 100 km
+    never become cheaper than shorter journeys (eliminates cliff-edge anomaly).
 
     Truck travels: Source → Station → Source.
     RTKM = Round Trip KM = src_to_stn_km × 2.
-
-      src_to_stn_km ≤ 100 km : Rs 1,750 × delivered_MT  (flat)
-      src_to_stn_km > 100 km : Rs 6.8 × delivered_MT × src_to_stn_km × 2
-
-    Args:
-      src_to_stn_km : road distance from SOURCE terminal to this station
-      delivered_mt  : MT unloaded at this stop only (not tank level)
     """
+    if delivered_mt <= 0:
+        return 0.0
+    flat_min = TRANSPORT_FLAT * delivered_mt
+    variable_rtkm = TRANSPORT_PER_KM * delivered_mt * src_to_stn_km * 2
     if src_to_stn_km <= TRANSPORT_THRESHOLD:
-        return TRANSPORT_FLAT * delivered_mt
-    return TRANSPORT_PER_KM * delivered_mt * src_to_stn_km * 2
+        return flat_min
+    # Ensure cost is monotonically non-decreasing
+    return max(flat_min, variable_rtkm)
 
 
 def transport_cost_calc(dist_km, qty_mt):
-    """General helper for source-selection ranking only."""
+    """General helper for source-selection ranking with floor enforcement."""
+    if qty_mt <= 0:
+        return 0.0
+    flat_min = TRANSPORT_FLAT * qty_mt
+    variable_cost = TRANSPORT_PER_KM * qty_mt * dist_km * 2
     if dist_km <= TRANSPORT_THRESHOLD:
-        return TRANSPORT_FLAT * qty_mt
-    return TRANSPORT_PER_KM * qty_mt * dist_km
+        return flat_min
+    return max(flat_min, variable_cost)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  UTILITIES

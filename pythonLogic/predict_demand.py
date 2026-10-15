@@ -1,177 +1,224 @@
 """
-Machine Learning Dynamic Monthly & Multi-Year Station Demand Forecasting Engine
-Ingests historical sales history files (or appends new monthly actuals) to:
-1. Parse dynamic history (e.g. 10 years + new monthly uploads).
-2. Auto-detect the latest recorded month (Month M).
-3. Re-train ML Model (RandomForestRegressor) using 80/20 Train-Test split.
-4. Calculate dynamic model metrics (R² Accuracy Score & RMSE).
-5. Forecast Next Month (Month M + 1) demand in Liters and Metric Tons per station.
+Machine Learning Enterprise Station Demand Forecasting Engine (81 KR Fuels Stations)
+Addresses Critical Audit Issues (P0 Issue 3, Issue 8, P1 Issues 19, 20, 21, 22, 25):
+1. Ingests actual sales history for all 81 stations from sales_data.xlsx.
+2. Checks data integrity: detects missing records/nulls and flags incomplete stations explicitly.
+3. Implements strict Chronological Train/Test Split (prevents future-data leakage).
+4. Features: Lagged sales (t-1, t-7), 7-day rolling statistics, calendar day/weekend flags.
+5. Benchmarks Random Forest Regressor against Baseline Naive Moving Average.
+6. Reports accurate error metrics: MAE, RMSE, and Out-of-Sample R² Score.
+7. Produces Low / Base / High (95% Confidence Interval) demand scenarios for procurement safety stock.
 """
 
-import sys, os, json, random
-from datetime import datetime
+import sys, os, json, math
+from datetime import datetime, timedelta
 import numpy as np
+import pandas as pd
 
 try:
-    import pandas as pd
     from sklearn.ensemble import RandomForestRegressor
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import r2_score, mean_squared_error
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
 
+DEFAULT_DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "sales_data.xlsx")
+STATIONS_DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "clean_stationss.xlsx")
+MT_TO_LITERS = 1810.0
 
-def generate_dynamic_historical_dataset(extra_months=0):
-    """Generates base multi-year dataset with optional additional monthly uploads appended."""
-    stations = ["Anna Nagar", "T Nagar", "Velachery", "Tambaram", "Porur"]
-    data = []
+
+def load_actual_sales_and_stations(sales_file=None):
+    file_to_read = sales_file if (sales_file and os.path.exists(sales_file)) else DEFAULT_DATA_PATH
+    if not os.path.exists(file_to_read):
+        alt_path = os.path.join(os.getcwd(), "data", "sales_data.xlsx")
+        if os.path.exists(alt_path):
+            file_to_read = alt_path
+
+    sales_df = pd.read_excel(file_to_read)
     
-    # Base 10 years = 120 months (2016 - 2025)
-    total_months = 120 + extra_months
-    start_year = 2016
+    st_path = STATIONS_DATA_PATH if os.path.exists(STATIONS_DATA_PATH) else os.path.join(os.getcwd(), "data", "clean_stationss.xlsx")
+    stations_info = {}
+    if os.path.exists(st_path):
+        st_df = pd.read_excel(st_path)
+        for _, r in st_df.iterrows():
+            name = str(r.get("Stations ") or r.get("Stations") or "").strip()
+            if name:
+                stations_info[name] = {
+                    "capacity_lt": float(r.get("Capacity in Lt", 17000)),
+                    "dead_stock_lt": float(r.get("Dead stock in Lt", 2000)),
+                    "usable_lt": float(r.get("Usable Lt", 15000))
+                }
+                
+    return sales_df, stations_info, file_to_read
+
+
+def build_time_series_features(series):
+    """Constructs lagged and rolling features without lookahead / future leakage."""
+    df_ts = pd.DataFrame({"actual": series.values})
+    df_ts["lag_1"] = df_ts["actual"].shift(1)
+    df_ts["lag_7"] = df_ts["actual"].shift(7)
+    df_ts["rolling_7_mean"] = df_ts["actual"].shift(1).rolling(7, min_periods=1).mean()
+    df_ts["rolling_7_std"] = df_ts["actual"].shift(1).rolling(7, min_periods=1).std().fillna(0.0)
+    return df_ts
+
+
+def run_enterprise_demand_forecasting(uploaded_file=None):
+    sales_df, stations_info, resolved_path = load_actual_sales_and_stations(uploaded_file)
     
-    for month_idx in range(total_months):
-        year = start_year + (month_idx // 12)
-        month = (month_idx % 12) + 1
-        
-        # Annual growth multiplier (~3.5% per year)
-        year_offset = year - start_year
-        growth_mult = 1.0 + (year_offset * 0.035)
-        
-        # Seasonal multiplier
-        season_mult = 1.15 if month in [4, 5, 10, 11, 12] else 0.95
-        
-        for st in stations:
-            base_sales = {
-                "Anna Nagar": 125000,
-                "T Nagar": 150000,
-                "Velachery": 110000,
-                "Tambaram": 140000,
-                "Porur": 105000
-            }[st]
-            
-            noise = random.uniform(0.95, 1.05)
-            monthly_demand_lt = round(base_sales * growth_mult * season_mult * noise)
-            
-            data.append({
-                "year": year,
-                "month": month,
+    station_cols = [c for c in sales_df.columns if c != "Date"]
+    total_stations = len(station_cols)
+    total_records = len(sales_df)
+    
+    # 1. Audit Data Integrity (Issue 20)
+    complete_stations = []
+    incomplete_stations = []
+    
+    for st in station_cols:
+        missing_count = int(sales_df[st].isna().sum())
+        if missing_count == 0:
+            complete_stations.append(st)
+        else:
+            incomplete_stations.append({
                 "station": st,
-                "monthly_demand_lt": monthly_demand_lt
+                "missing_days": missing_count,
+                "data_quality_status": "DATA_INCOMPLETE",
+                "notes": f"Missing {missing_count} daily sales observations. Operational forecast suspended until data validated."
             })
-            
-    return data, total_months
 
+    # 2. Chronological Split (Issue 8) - No future leakage
+    split_idx = int(total_records * 0.80)  # Chronological 80% train, 20% test
+    train_dates = (str(sales_df['Date'].iloc[0]).split()[0], str(sales_df['Date'].iloc[split_idx - 1]).split()[0])
+    test_dates = (str(sales_df['Date'].iloc[split_idx]).split()[0], str(sales_df['Date'].iloc[-1]).split()[0])
 
-def train_and_predict_monthly_demand(file_path=None, extra_months=1):
-    stations = ["Anna Nagar", "T Nagar", "Velachery", "Tambaram", "Porur"]
+    all_y_true = []
+    all_y_pred_rf = []
+    all_y_pred_baseline = []
     
-    df = None
-    if file_path and os.path.exists(file_path):
-        try:
-            if file_path.endswith(".csv"):
-                df = pd.read_csv(file_path)
-            else:
-                df = pd.read_excel(file_path)
-        except Exception:
-            df = None
-            
-    if df is None or df.empty:
-        records, total_months = generate_dynamic_historical_dataset(extra_months=extra_months)
-        df = pd.DataFrame(records)
-    else:
-        total_months = len(df["month"].unique()) * len(df["year"].unique()) if "month" in df.columns else len(df)
-        
-    # Determine latest year and month in dataset
-    latest_year = int(df["year"].max()) if "year" in df.columns else 2025
-    latest_month = int(df[df["year"] == latest_year]["month"].max()) if "month" in df.columns else 12
+    station_predictions = []
     
-    # Next month target (Month M + 1)
-    if latest_month == 12:
-        target_year = latest_year + 1
-        target_month = 1
-    else:
-        target_year = latest_year
-        target_month = latest_month + 1
+    for st in complete_stations:
+        series = sales_df[st].astype(float)
+        st_info = stations_info.get(st.strip(), {
+            "capacity_lt": 17000.0,
+            "dead_stock_lt": 2000.0,
+            "usable_lt": 15000.0
+        })
         
-    month_names = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
-    target_period_str = f"{month_names[target_month - 1]} {target_year}"
-    latest_period_str = f"{month_names[latest_month - 1]} {latest_year}"
+        # Build strict historical feature frame
+        ts_feat = build_time_series_features(series)
+        valid_rows = ts_feat.dropna()
+        
+        # Chronological Train vs Test
+        train_feat = valid_rows.iloc[:max(1, split_idx - 7)]
+        test_feat = valid_rows.iloc[max(1, split_idx - 7):]
+        
+        if len(test_feat) == 0:
+            test_feat = valid_rows.tail(5)
+            train_feat = valid_rows.iloc[:-5]
 
-    if SKLEARN_AVAILABLE:
-        # Feature Engineering: One-hot encode stations
-        df_encoded = pd.get_dummies(df, columns=["station"], drop_first=False)
-        X = df_encoded.drop(columns=["monthly_demand_lt"])
-        y = df_encoded["monthly_demand_lt"]
+        X_train = train_feat[["lag_1", "lag_7", "rolling_7_mean", "rolling_7_std"]]
+        y_train = train_feat["actual"]
+        X_test = test_feat[["lag_1", "lag_7", "rolling_7_mean", "rolling_7_std"]]
+        y_test = test_feat["actual"]
         
-        # 80/20 Train-Test Split
-        test_size = 0.20
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+        # Baseline model: Seasonal / 7-day Naive moving average (Issue 21)
+        y_pred_base = test_feat["rolling_7_mean"].values
         
-        # Train RandomForestRegressor Model on all historical months
-        model = RandomForestRegressor(n_estimators=100, random_state=42)
-        model.fit(X_train, y_train)
-        
-        # Model Evaluation on Test set
-        y_pred = model.predict(X_test)
-        r2 = round(r2_score(y_test, y_pred), 4)
-        rmse = round(float(np.sqrt(mean_squared_error(y_test, y_pred))), 2)
-        accuracy_pct = round(r2 * 100, 2)
-        
-        next_month_predictions = []
-        
-        for st in stations:
-            feature_dict = {"year": target_year, "month": target_month}
-            for station_col in [c for c in X.columns if c.startswith("station_")]:
-                feature_dict[station_col] = 1 if station_col == f"station_{st}" else 0
+        # Random Forest Regressor
+        if SKLEARN_AVAILABLE and len(X_train) >= 3:
+            rf = RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42)
+            rf.fit(X_train, y_train)
+            y_pred_rf = rf.predict(X_test)
             
-            input_df = pd.DataFrame([feature_dict])[X.columns]
-            pred_demand_lt = round(float(model.predict(input_df)[0]))
-            pred_demand_mt = round(pred_demand_lt / 1810, 2)
+            # Predict Next Month (30 days ahead demand)
+            latest_features = ts_feat[["lag_1", "lag_7", "rolling_7_mean", "rolling_7_std"]].iloc[[-1]]
+            next_day_pred = float(rf.predict(latest_features)[0])
+            monthly_forecast_lt = round(next_day_pred * 30.0)
             
-            st_df = df[df["station"] == st]
-            hist_avg_lt = round(float(st_df["monthly_demand_lt"].mean()))
-            growth_vs_hist = round(((pred_demand_lt - hist_avg_lt) / hist_avg_lt) * 100, 1)
-            
-            next_month_predictions.append({
-                "station": st,
-                "predicted_next_month_lt": pred_demand_lt,
-                "predicted_next_month_mt": pred_demand_mt,
-                "historical_10yr_avg_lt": hist_avg_lt,
-                "projected_growth_pct": growth_vs_hist,
-                "recommended_monthly_alloc_mt": round(pred_demand_mt * 1.05, 2) # 5% safety buffer
-            })
-            
-    else:
-        r2 = 0.9485
-        accuracy_pct = 94.85
-        rmse = 6500.0
-        
-        next_month_predictions = [
-            {"station": "Anna Nagar", "predicted_next_month_lt": 158200, "predicted_next_month_mt": 87.40, "historical_10yr_avg_lt": 149000, "projected_growth_pct": 6.1, "recommended_monthly_alloc_mt": 91.77},
-            {"station": "T Nagar", "predicted_next_month_lt": 181500, "predicted_next_month_mt": 100.27, "historical_10yr_avg_lt": 179500, "projected_growth_pct": 1.1, "recommended_monthly_alloc_mt": 105.28},
-            {"station": "Velachery", "predicted_next_month_lt": 139400, "predicted_next_month_mt": 77.01, "historical_10yr_avg_lt": 132100, "projected_growth_pct": 5.5, "recommended_monthly_alloc_mt": 80.86},
-            {"station": "Tambaram", "predicted_next_month_lt": 170800, "predicted_next_month_mt": 94.36, "historical_10yr_avg_lt": 168200, "projected_growth_pct": 1.5, "recommended_monthly_alloc_mt": 99.07},
-            {"station": "Porur", "predicted_next_month_lt": 131200, "predicted_next_month_mt": 72.48, "historical_10yr_avg_lt": 125800, "projected_growth_pct": 4.2, "recommended_monthly_alloc_mt": 76.10}
-        ]
+            # Error standard deviation for 95% Confidence Intervals
+            resids = y_train.values - rf.predict(X_train)
+            sigma = float(np.std(resids)) if len(resids) > 1 else (next_day_pred * 0.08)
+        else:
+            y_pred_rf = y_pred_base
+            next_day_pred = float(series.mean())
+            monthly_forecast_lt = round(next_day_pred * 30.0)
+            sigma = next_day_pred * 0.10
 
-    n_train = int(len(df) * 0.8)
-    n_test = len(df) - n_train
+        all_y_true.extend(y_test.values)
+        all_y_pred_rf.extend(y_pred_rf)
+        all_y_pred_baseline.extend(y_pred_base)
+        
+        # 95% Confidence interval (Issue 25)
+        monthly_forecast_mt = round(monthly_forecast_lt / MT_TO_LITERS, 2)
+        ci_95_band_lt = round(1.96 * sigma * math.sqrt(30))
+        low_demand_lt = max(0, monthly_forecast_lt - ci_95_band_lt)
+        high_demand_lt = monthly_forecast_lt + ci_95_band_lt
+        
+        # Depletion & Replenishment Math (Issue 2)
+        current_usable = st_info["usable_lt"]
+        tank_capacity = st_info["capacity_lt"]
+        available_ullage = max(0.0, tank_capacity - (st_info["dead_stock_lt"] + current_usable))
+        days_to_empty = round(current_usable / max(1.0, next_day_pred), 1)
+        
+        # Recommended immediate replenishment (respecting physical storage ullage)
+        recommended_refill_lt = min(available_ullage, monthly_forecast_lt)
+        
+        station_predictions.append({
+            "station": st.strip(),
+            "data_quality": "VERIFIED_COMPLETE",
+            "historical_daily_avg_lt": round(float(series.mean()), 1),
+            "projected_daily_demand_lt": round(next_day_pred, 1),
+            "next_month_base_demand_lt": monthly_forecast_lt,
+            "next_month_base_demand_mt": monthly_forecast_mt,
+            "scenario_low_demand_lt": low_demand_lt,
+            "scenario_high_demand_lt": high_demand_lt,
+            "days_to_depletion": days_to_empty,
+            "recommended_refill_lt": round(recommended_refill_lt),
+            "available_storage_ullage_lt": round(available_ullage),
+            "replenishment_urgency": "HIGH" if days_to_empty <= 2.0 else "MEDIUM" if days_to_empty <= 5.0 else "NORMAL"
+        })
+
+    # Overall Model Validation Metrics (Issue 21, 22)
+    y_true_arr = np.array(all_y_true)
+    y_rf_arr = np.array(all_y_pred_rf)
+    y_base_arr = np.array(all_y_pred_baseline)
+    
+    rf_mae = round(float(mean_absolute_error(y_true_arr, y_rf_arr)), 2)
+    rf_rmse = round(float(np.sqrt(mean_squared_error(y_true_arr, y_rf_arr))), 2)
+    base_mae = round(float(mean_absolute_error(y_true_arr, y_base_arr)), 2)
+    base_rmse = round(float(np.sqrt(mean_squared_error(y_true_arr, y_base_arr))), 2)
+    
+    out_of_sample_r2 = round(float(r2_score(y_true_arr, y_rf_arr)), 4)
+    mae_improvement_pct = round(((base_mae - rf_mae) / max(1e-5, base_mae)) * 100.0, 1)
 
     return {
-        "model_type": "RandomForestRegressor (Dynamic Multi-Year Time-Series)",
-        "total_historical_records": len(df),
-        "dataset_latest_month": latest_period_str,
-        "train_test_split": f"80% Train ({n_train} Monthly Records) / 20% Test ({n_test} Monthly Records)",
-        "model_accuracy_score": f"{accuracy_pct}% (R² = {r2})",
-        "root_mean_squared_error_lt": rmse,
-        "forecast_period": f"Next Month ({target_period_str})",
-        "predictions": next_month_predictions
+        "status": "SUCCESS",
+        "data_source_file": os.path.basename(resolved_path),
+        "total_stations_evaluated": total_stations,
+        "complete_stations_count": len(complete_stations),
+        "incomplete_stations_flagged": len(incomplete_stations),
+        "incomplete_stations_details": incomplete_stations,
+        "chronological_split_design": {
+            "strategy": "Strict Chronological Forward Split (No Future Data Leakage)",
+            "training_period": f"{train_dates[0]} to {train_dates[1]} (Chronological 80%)",
+            "unseen_test_period": f"{test_dates[0]} to {test_dates[1]} (Chronological 20%)"
+        },
+        "model_benchmark_comparison": {
+            "ml_model": "RandomForestRegressor (Lagged + Rolling Stats)",
+            "baseline_model": "7-Day Naive Moving Average (Seasonal Baseline)",
+            "ml_model_mae_lt": rf_mae,
+            "baseline_mae_lt": base_mae,
+            "ml_model_rmse_lt": rf_rmse,
+            "baseline_rmse_lt": base_rmse,
+            "out_of_sample_r2": out_of_sample_r2,
+            "mae_error_reduction_vs_baseline": f"{mae_improvement_pct}% lower error"
+        },
+        "forecast_period": "Next Month (30-Day Forward Procurement)",
+        "predictions": sorted(station_predictions, key=lambda x: x["days_to_depletion"])
     }
 
 
 if __name__ == "__main__":
     file_arg = sys.argv[1] if len(sys.argv) > 1 else None
-    out = train_and_predict_monthly_demand(file_path=file_arg)
-    print(json.dumps(out, indent=2))
+    results = run_enterprise_demand_forecasting(file_arg)
+    print(json.dumps(results, indent=2))

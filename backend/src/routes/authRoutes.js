@@ -22,17 +22,13 @@ router.post("/login", (req, res) => {
       }
 
       const rawPassword = String(password);
-      let isValid = false;
       
-      if (user.password_hash && user.password_hash.startsWith("$2")) {
-        isValid = await bcrypt.compare(rawPassword, user.password_hash);
-      } else if (rawPassword === String(user.password_hash || "")) {
-        isValid = true;
-        // Upgrade legacy plaintext hash to bcrypt
-        user.password_hash = await bcrypt.hash(rawPassword, 10);
-        await user.save().catch(() => {});
+      // Strict security: Plaintext password fallback is removed. All passwords must be bcrypt hashed.
+      if (!user.password_hash || !user.password_hash.startsWith("$2")) {
+        return res.status(401).json({ message: "Account security requires password reset to bcrypt hash. Plaintext login disabled." });
       }
 
+      const isValid = await bcrypt.compare(rawPassword, user.password_hash);
       if (!isValid) {
         return res.status(401).json({ message: "Invalid credentials." });
       }
