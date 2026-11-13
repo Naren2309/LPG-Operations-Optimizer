@@ -43,7 +43,8 @@ export const FeatureLaunchpad = ({ role, onSelectFeature, planBundle, stations, 
     { key: "fleet", title: "🚛 Fleet Inventory & Onboard Fuel Manager", icon: "🚛", badge: `${trucks.length} Tankers` },
     { key: "terminals", title: "🏭 Supply Terminals & Market Prices", icon: "🏭", badge: `${sourceComparison.length} Terminals` },
     { key: "driver", title: "🚚 Driver Real-Time Dispatch Portal", icon: "🚚", badge: "Driver App" },
-    { key: "manager", title: "⛽ Station Fuel Stock Manager Portal", icon: "⛽", badge: "Manager App" }
+    { key: "manager", title: "⛽ Station Fuel Stock Manager Portal", icon: "⛽", badge: "Manager App" },
+    { key: "roadmap", title: "🚀 Future Roadmap & Architecture", icon: "🚀", badge: "Interview Ready" }
   ];
 
   return (

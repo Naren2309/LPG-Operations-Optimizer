@@ -14,6 +14,7 @@ import { UnservedSwapSection } from "./UnservedSwapSection";
 import { RoutePlanCard } from "./RoutePlanCard";
 import { FleetTable } from "./FleetTable";
 import { SourceComparisonTable } from "./SourceComparisonTable";
+import { FutureRoadmap } from "./FutureRoadmap";
 import { generateRoutePlan, decideSwapResolution } from "../../services/api";
 
 export const AdminDashboard = ({
@@ -247,6 +248,11 @@ export const AdminDashboard = ({
         <IotTelemetrySimulator stations={stations} onTelemetrySent={onRefresh} />
       </div>
     );
+  }
+
+  // PAGE 7: FUTURE ROADMAP & TECHNICAL ARCHITECTURE
+  if (activeTab === "roadmap") {
+    return <FutureRoadmap />;
   }
 
   return null;

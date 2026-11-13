@@ -13,7 +13,8 @@ const TAB_TITLES = {
   mldemand: "🤖 Machine Learning Fuel Demand Forecasting",
   iot: "📡 Automatic Tank Gauge (ATG) IoT Telemetry Hub",
   driver: "🚚 Driver Real-Time Dispatch Portal",
-  manager: "⛽ Station Fuel Stock Management Portal"
+  manager: "⛽ Station Fuel Stock Management Portal",
+  roadmap: "🚀 Future Roadmap & Architecture Strategy"
 };
 
 export const TopHeader = ({ auth, activeTab, onBackToHub, onLogout, isAutoRefresh, setIsAutoRefresh, onRefresh, loading }) => {

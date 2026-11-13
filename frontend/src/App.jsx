@@ -213,7 +213,7 @@ export function App() {
               />
             )}
 
-            {["overview", "routes", "swaps", "terminals", "fleet", "sumo", "mldemand", "map"].includes(activeTab) && (
+            {["overview", "routes", "swaps", "terminals", "fleet", "sumo", "mldemand", "map", "roadmap"].includes(activeTab) && (
               <AdminDashboard
                 activeTab={activeTab}
                 setActiveTab={setActiveTab}

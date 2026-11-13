@@ -111,6 +111,14 @@ export const FeatureNavMenu = ({ role, activeTab, setActiveTab }) => {
             ⛽ Station Manager View
           </button>
         </li>
+        <li className="nav-item">
+          <button
+            className={`nav-link fw-bold ${activeTab === "roadmap" ? "active bg-primary" : "text-dark"}`}
+            onClick={() => setActiveTab("roadmap")}
+          >
+            🚀 Future Roadmap
+          </button>
+        </li>
       </ul>
     </div>
   );
