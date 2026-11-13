@@ -34,8 +34,16 @@ export const RoutePlanCard = ({ planBundle }) => {
             return (
               <div key={idx} className="col-12 col-xl-6">
                 <div className="card h-100 border">
-                  <div className="card-header bg-light d-flex justify-content-between align-items-center">
-                    <span className="fw-bold text-primary">🚛 Truck: {run.truck_id} ({run.truck_type})</span>
+                  <div className="card-header bg-light d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <div>
+                      <span className="fw-bold text-primary">🚛 Truck: {run.truck_id} ({run.truck_type})</span>
+                      {run.trip_number && (
+                        <span className="badge bg-warning text-dark ms-2">Trip #{run.trip_number}</span>
+                      )}
+                      {run.n_reloads > 0 && (
+                        <span className="badge bg-success ms-1">Multi-Trip Reload #{run.n_reloads}</span>
+                      )}
+                    </div>
                     <span className="badge bg-dark">Supply Terminal: {run.source_id}</span>
                   </div>
 
@@ -44,6 +52,12 @@ export const RoutePlanCard = ({ planBundle }) => {
                       <div className="col-6"><strong>Total Load:</strong> {run.total_load_lt?.toLocaleString()} L ({run.total_mt} MT)</div>
                       <div className="col-6 text-end"><strong>Est. Distance:</strong> {run.total_distance_km || costRow?.tot_rtkm || 0} km</div>
                     </div>
+                    {run.shift_duration_min && (
+                      <div className="p-2 mb-2 bg-light border rounded small d-flex justify-content-between align-items-center">
+                        <span>⏱️ <strong>Trip Duration:</strong> {run.trip_duration_min} min</span>
+                        <span><strong>Shift Time:</strong> {run.cumulative_shift_min || run.trip_duration_min} / {run.max_shift_min || 480} min</span>
+                      </div>
+                    )}
 
                     <h6 className="fw-bold text-muted border-bottom pb-1 small">Stops & Sequence:</h6>
                     <ul className="list-group list-group-flush mb-3 small">

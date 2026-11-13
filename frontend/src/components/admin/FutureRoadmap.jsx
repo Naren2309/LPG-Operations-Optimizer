@@ -4,11 +4,11 @@ export const FutureRoadmap = () => {
   const enhancements = [
     {
       area: "Optimization algorithm",
-      badge: "Solver & Formulation",
-      badgeColor: "primary",
-      current: "Sequential heuristic-based approach: source selection → station grouping → truck allocation",
-      limitation: "Sequential decisions may produce locally optimal but globally suboptimal dispatch plans.",
-      recommendation: "Integrate Google OR-Tools to formulate a Multi-Depot Capacitated Vehicle Routing Problem (MD-CVRP), considering source selection, truck capacity, demand and transportation cost."
+      badge: "Integrated: OR-Tools MD-CVRP",
+      badgeColor: "success",
+      current: "Google OR-Tools Multi-Depot (MD-CVRP) joint optimization with CP-SAT and Guided Local Search (heuristic fallback)",
+      limitation: "Jointly optimizes source terminal selection, vehicle capacity limits, and landed transit costs in the primary dispatch pipeline.",
+      recommendation: "Operational: Solves Multi-Depot CVRP directly on depleted stations and candidate refinery sources."
     },
     {
       area: "Commercial vehicle routing",
@@ -28,11 +28,11 @@ export const FutureRoadmap = () => {
     },
     {
       area: "Multi-trip scheduling",
-      badge: "Fleet Utilization",
-      badgeColor: "warning",
-      current: "One delivery run per truck per planning execution",
-      limitation: "Trucks returning early cannot be reassigned for another delivery within the same planning run.",
-      recommendation: "Implement Multi-Trip Vehicle Routing (MT-VRP) to maximize truck utilization within working-hour and loading constraints."
+      badge: "Integrated: MT-VRP",
+      badgeColor: "success",
+      current: "Multi-Trip Vehicle Routing (MT-VRP) with 480-min shift limit, 45-min loading, and 30-min unloading constraints",
+      limitation: "Allows trucks completing early runs to be reassigned for secondary trips within the same planning execution.",
+      recommendation: "Operational: Dynamic multi-trip allocation maximizing fleet utilization under driver shift constraints."
     },
     {
       area: "Toll calculation",
@@ -108,15 +108,15 @@ export const FutureRoadmap = () => {
               <div className="p-3 rounded-3" style={{ backgroundColor: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.15)" }}>
                 <div className="text-info fw-bold small text-uppercase mb-1">Current Implementation (Working in Repo)</div>
                 <p className="mb-0 small text-light">
-                  <strong>Random Forest Regressor</strong> + <strong>sequential heuristic optimization</strong> (source selection → grouping → fleet allocation) + <strong>Haversine (1.3×) fallback</strong> + <strong>Google Routes API</strong> + <strong>MongoDB</strong> + <strong>React</strong> + <strong>Node.js</strong>.
+                  <strong>Google OR-Tools MD-CVRP</strong> + <strong>Multi-Trip Scheduling (MT-VRP)</strong> + <strong>Random Forest Regressor</strong> + <strong>Sequential Heuristic Fallback</strong> + <strong>Google Routes API</strong> + <strong>MongoDB</strong> + <strong>React</strong> + <strong>Node.js</strong>.
                 </p>
               </div>
             </div>
             <div className="col-md-6">
               <div className="p-3 rounded-3" style={{ backgroundColor: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.15)" }}>
-                <div className="text-warning fw-bold small text-uppercase mb-1">Future Enhancements (Scale Architecture)</div>
+                <div className="text-warning fw-bold small text-uppercase mb-1">Scale Roadmap Enhancements</div>
                 <p className="mb-0 small text-light">
-                  <strong>Google OR-Tools (MD-CVRP)</strong> + <strong>commercial tanker HGV routing</strong> + <strong>multi-trip scheduling (MT-VRP)</strong> + <strong>self-hosted OSRM</strong> + <strong>verified toll data (NHAI TIS / TollGuru)</strong> + <strong>integrated traffic</strong> + <strong>XGBoost/LightGBM forecasting</strong>.
+                  <strong>Commercial tanker HGV routing</strong> + <strong>self-hosted OSRM matrix scaling</strong> + <strong>verified toll data (NHAI TIS / TollGuru)</strong> + <strong>real-time traffic integration</strong> + <strong>XGBoost/LightGBM forecasting</strong>.
                 </p>
               </div>
             </div>

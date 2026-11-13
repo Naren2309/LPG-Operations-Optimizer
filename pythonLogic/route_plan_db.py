@@ -12,6 +12,12 @@ from pymongo import MongoClient, UpdateOne
 
 import logic3 as l3
 
+try:
+    from ortools.sat.python import cp_model
+    ORTOOLS_AVAILABLE = True
+except ImportError:
+    ORTOOLS_AVAILABLE = False
+
 MONGO_URI = os.getenv("MONGO_URI")
 DB_NAME = os.getenv("DB_NAME") or "operations_optimization"
 PLAN_ID = os.getenv("PLAN_ID") or str(uuid.uuid4())
@@ -51,6 +57,19 @@ ROUTE_MAX_STOPS_PER_TRUCK = env_int(
 ROUTE_MAX_GROUPING_KM = env_float("ROUTE_MAX_GROUPING_KM", l3.MAX_GROUPING_KM, minimum=0.0)
 ROUTE_SPLIT_LOOKBACK_MONTHS = env_int("ROUTE_SPLIT_LOOKBACK_MONTHS", 1, minimum=0)
 ROUTE_SOURCE_ASSIGNMENT_WORKERS = env_int("ROUTE_SOURCE_ASSIGNMENT_WORKERS", 4, minimum=1)
+
+USE_OR_TOOLS = str(os.getenv("USE_OR_TOOLS") or "1").strip().lower() in ("1", "true", "yes")
+ROUTE_WORK_DAY_MIN = env_int("ROUTE_WORK_DAY_MIN", 480, minimum=120)
+ROUTE_LOAD_MIN_AT_SOURCE = env_int("ROUTE_LOAD_MIN_AT_SOURCE", 45, minimum=10)
+ROUTE_UNLOAD_MIN_PER_STOP = env_int("ROUTE_UNLOAD_MIN_PER_STOP", 30, minimum=10)
+ROUTE_AVG_SPEED_KMH = env_float("ROUTE_AVG_SPEED_KMH", 40.0, minimum=10.0)
+ROUTE_MAX_TRIPS_PER_TRUCK = env_int("ROUTE_MAX_TRIPS_PER_TRUCK", 2, minimum=1)
+
+def estimate_transit_time_min(dist_km):
+    if dist_km <= 0:
+        return 0.0
+    plazas = max(0, int(dist_km / 55.0)) if dist_km >= 35 else 0
+    return round((dist_km / ROUTE_AVG_SPEED_KMH) * 60.0 + plazas * 3.5, 1)
 
 l3.MAX_STOPS_PER_TRUCK = ROUTE_MAX_STOPS_PER_TRUCK
 l3.MAX_GROUPING_KM = ROUTE_MAX_GROUPING_KM
@@ -559,7 +578,364 @@ def assign_cheapest_source(stations, sources):
     return [indexed[idx] for idx in sorted(indexed.keys())]
 
 
-def build_plan(stations, sources, trucks, avg_sales):
+def build_plan_ortools(stations, sources, trucks, avg_sales):
+    needing = [s for s in stations if s["now"] == "NO" and s["needed_lt"] > 0]
+    if not needing:
+        return [], [], trucks, []
+
+    # 1. Candidate trip generation (1-stop and 2-stop combinations)
+    candidate_trips = []
+    
+    # 1-stop candidate trips
+    for s_idx, station in enumerate(needing):
+        slat = float(station["station_lat"])
+        slon = float(station["station_lon"])
+        sneed = float(station["needed_lt"])
+        smt = sneed / l3.MT_TO_LITERS
+        
+        # Rank sources by approximate landed cost
+        def approx_c(src):
+            d = l3.haversine(slat, slon, float(src["source_lat"]), float(src["source_lon"])) * 1.3
+            return l3.transport_cost_calc(d, smt) + float(src["price_mt"]) * smt
+        ranked_sources = sorted(sources, key=approx_c)[:6]
+        
+        for src in ranked_sources:
+            src_lat = float(src["source_lat"])
+            src_lon = float(src["source_lon"])
+            src_id = src["source_id"]
+            src_name = src["source_name"]
+            price_mt = float(src["price_mt"])
+            
+            d_leg, toll = l3.get_road_info(src_lat, src_lon, slat, slon)
+            tc = l3.transport_cost_rtkm(d_leg, smt)
+            pc = price_mt * smt
+            landed_cost = tc + pc + toll
+            dur = ROUTE_LOAD_MIN_AT_SOURCE + estimate_transit_time_min(d_leg) + ROUTE_UNLOAD_MIN_PER_STOP + estimate_transit_time_min(d_leg)
+            
+            candidate_trips.append({
+                "stations": [s_idx],
+                "station_names": [station["station"]],
+                "source_id": src_id,
+                "source_name": src_name,
+                "source_lat": src_lat,
+                "source_lon": src_lon,
+                "price_mt": price_mt,
+                "total_demand_lt": sneed,
+                "total_demand_mt": smt,
+                "landed_cost": landed_cost,
+                "trip_duration_min": dur,
+                "stops": [{
+                    "station": station["station"],
+                    "needed_lt": sneed,
+                    "needed_mt": round(smt, 3),
+                    "deliver_lt": sneed,
+                    "deliver_mt": round(smt, 3),
+                    "station_lat": slat,
+                    "station_lon": slon,
+                    "avg_sales": l3.get_sales_avg(avg_sales, station["station"]),
+                    "split_pct": 100.0
+                }]
+            })
+
+    # 2-stop candidate trips (inter-station distance <= ROUTE_MAX_GROUPING_KM)
+    for i in range(len(needing)):
+        for j in range(i + 1, len(needing)):
+            st1 = needing[i]; st2 = needing[j]
+            lat1, lon1 = float(st1["station_lat"]), float(st1["station_lon"])
+            lat2, lon2 = float(st2["station_lat"]), float(st2["station_lon"])
+            d_12 = l3.haversine(lat1, lon1, lat2, lon2)
+            if d_12 > ROUTE_MAX_GROUPING_KM:
+                continue
+                
+            n1_lt = float(st1["needed_lt"]); n1_mt = n1_lt / l3.MT_TO_LITERS
+            n2_lt = float(st2["needed_lt"]); n2_mt = n2_lt / l3.MT_TO_LITERS
+            tot_lt = n1_lt + n2_lt; tot_mt = tot_lt / l3.MT_TO_LITERS
+            
+            # Skip if total demand exceeds maximum fleet truck capacity
+            max_fleet_cap = max((float(t.get("capacity_lt") or 21720) for t in trucks), default=21720)
+            if tot_lt > max_fleet_cap:
+                continue
+                
+            mid_lat = (lat1 + lat2) / 2.0; mid_lon = (lon1 + lon2) / 2.0
+            def approx_c2(src):
+                d = l3.haversine(mid_lat, mid_lon, float(src["source_lat"]), float(src["source_lon"])) * 1.3
+                return l3.transport_cost_calc(d, tot_mt) + float(src["price_mt"]) * tot_mt
+            ranked_sources2 = sorted(sources, key=approx_c2)[:4]
+            
+            for src in ranked_sources2:
+                src_lat = float(src["source_lat"])
+                src_lon = float(src["source_lon"])
+                src_id = src["source_id"]
+                src_name = src["source_name"]
+                price_mt = float(src["price_mt"])
+                
+                d_s1, t_s1 = l3.get_road_info(src_lat, src_lon, lat1, lon1)
+                d_road_12, t_12 = l3.get_road_info(lat1, lon1, lat2, lon2)
+                d_2s, _ = l3.get_road_info(lat2, lon2, src_lat, src_lon)
+                
+                if d_road_12 > ROUTE_MAX_GROUPING_KM:
+                    continue
+                    
+                tc1 = l3.transport_cost_rtkm(d_s1, n1_mt)
+                tc2 = l3.transport_cost_rtkm(d_road_12, n2_mt)
+                pc = price_mt * tot_mt
+                toll = t_s1 + t_12
+                landed_cost = tc1 + tc2 + pc + toll
+                dur = (ROUTE_LOAD_MIN_AT_SOURCE + estimate_transit_time_min(d_s1) + ROUTE_UNLOAD_MIN_PER_STOP +
+                       estimate_transit_time_min(d_road_12) + ROUTE_UNLOAD_MIN_PER_STOP + estimate_transit_time_min(d_2s))
+                
+                candidate_trips.append({
+                    "stations": [i, j],
+                    "station_names": [st1["station"], st2["station"]],
+                    "source_id": src_id,
+                    "source_name": src_name,
+                    "source_lat": src_lat,
+                    "source_lon": src_lon,
+                    "price_mt": price_mt,
+                    "total_demand_lt": tot_lt,
+                    "total_demand_mt": tot_mt,
+                    "landed_cost": landed_cost,
+                    "trip_duration_min": dur,
+                    "stops": [
+                        {
+                            "station": st1["station"],
+                            "needed_lt": n1_lt,
+                            "needed_mt": round(n1_mt, 3),
+                            "deliver_lt": n1_lt,
+                            "deliver_mt": round(n1_mt, 3),
+                            "station_lat": lat1,
+                            "station_lon": lon1,
+                            "avg_sales": l3.get_sales_avg(avg_sales, st1["station"]),
+                            "split_pct": round((n1_lt / tot_lt) * 100, 1)
+                        },
+                        {
+                            "station": st2["station"],
+                            "needed_lt": n2_lt,
+                            "needed_mt": round(n2_mt, 3),
+                            "deliver_lt": n2_lt,
+                            "deliver_mt": round(n2_mt, 3),
+                            "station_lat": lat2,
+                            "station_lon": lon2,
+                            "avg_sales": l3.get_sales_avg(avg_sales, st2["station"]),
+                            "split_pct": round((n2_lt / tot_lt) * 100, 1)
+                        }
+                    ]
+                })
+
+    if not candidate_trips:
+        return None
+
+    model = cp_model.CpModel()
+    num_stations = len(needing)
+    num_trucks = len(trucks)
+    max_trips = ROUTE_MAX_TRIPS_PER_TRUCK
+    
+    x = {}
+    for t_idx, trip in enumerate(candidate_trips):
+        for k_idx, truck in enumerate(trucks):
+            for slot in range(max_trips):
+                if trip["total_demand_lt"] <= truck["capacity_lt"]:
+                    x[t_idx, k_idx, slot] = model.NewBoolVar(f"x_{t_idx}_{k_idx}_{slot}")
+
+    # Coverage: Each station covered exactly once
+    for s_idx in range(num_stations):
+        vars_for_s = [
+            x[t_idx, k_idx, slot]
+            for t_idx, trip in enumerate(candidate_trips) if s_idx in trip["stations"]
+            for k_idx in range(num_trucks)
+            for slot in range(max_trips)
+            if (t_idx, k_idx, slot) in x
+        ]
+        if vars_for_s:
+            model.Add(sum(vars_for_s) == 1)
+
+    # Exclusivity & Sequence constraints per truck
+    for k_idx in range(num_trucks):
+        for slot in range(max_trips):
+            slot_vars = [x[t_idx, k_idx, slot] for t_idx in range(len(candidate_trips)) if (t_idx, k_idx, slot) in x]
+            if slot_vars:
+                model.Add(sum(slot_vars) <= 1)
+        v0 = [x[t_idx, k_idx, 0] for t_idx in range(len(candidate_trips)) if (t_idx, k_idx, 0) in x]
+        v1 = [x[t_idx, k_idx, 1] for t_idx in range(len(candidate_trips)) if (t_idx, k_idx, 1) in x]
+        if v0 and v1:
+            model.Add(sum(v1) <= sum(v0))
+
+    # Working hour constraint (ROUTE_WORK_DAY_MIN)
+    for k_idx, truck in enumerate(trucks):
+        time_terms = []
+        p_lat = float(truck["parked_lat"]); p_lon = float(truck["parked_lon"])
+        for t_idx, trip in enumerate(candidate_trips):
+            dur = int(trip["trip_duration_min"])
+            d_dead, _ = l3.get_road_info(p_lat, p_lon, trip["source_lat"], trip["source_lon"])
+            t_dead = int(estimate_transit_time_min(d_dead))
+            
+            if (t_idx, k_idx, 0) in x:
+                time_terms.append(x[t_idx, k_idx, 0] * (dur + t_dead))
+            if (t_idx, k_idx, 1) in x:
+                time_terms.append(x[t_idx, k_idx, 1] * dur)
+        if time_terms:
+            model.Add(sum(time_terms) <= ROUTE_WORK_DAY_MIN)
+
+    # Objective: Minimize Landed Cost + Deadhead
+    obj = []
+    for (t_idx, k_idx, slot), var in x.items():
+        trip = candidate_trips[t_idx]
+        truck = trucks[k_idx]
+        cost = trip["landed_cost"]
+        if slot == 0:
+            d_dead, _ = l3.get_road_info(float(truck["parked_lat"]), float(truck["parked_lon"]), trip["source_lat"], trip["source_lon"])
+            cost += l3.transport_cost_empty(d_dead)
+        obj.append(var * int(cost))
+
+    model.Minimize(sum(obj))
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 10.0
+    status = solver.Solve(model)
+
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return None
+
+    # Construct the full delivery plans
+    start_pos = {
+        t["truck_id"]: {
+            "station": t["parked_label"],
+            "lat": t["parked_lat"],
+            "lon": t["parked_lon"],
+        }
+        for t in trucks
+    }
+    truck_by_id = {t["truck_id"]: t for t in trucks}
+    delivery_plans = []
+    covered_stations = set()
+
+    for k_idx, truck in enumerate(trucks):
+        trips_assigned = []
+        for slot in range(max_trips):
+            for t_idx, trip in enumerate(candidate_trips):
+                if (t_idx, k_idx, slot) in x and solver.Value(x[t_idx, k_idx, slot]) == 1:
+                    trips_assigned.append((slot + 1, trip))
+
+        if not trips_assigned:
+            continue
+
+        curr_pos = {
+            "station": start_pos[truck["truck_id"]]["station"],
+            "lat": start_pos[truck["truck_id"]]["lat"],
+            "lon": start_pos[truck["truck_id"]]["lon"]
+        }
+        cumul_shift = 0.0
+
+        for trip_num, trip in trips_assigned:
+            run_stops = trip["stops"]
+            for st in run_stops:
+                covered_stations.add(st["station"])
+
+            journey_steps, costs = l3.build_journey(
+                truck,
+                curr_pos,
+                trip["source_id"],
+                trip["source_name"],
+                trip["source_lat"],
+                trip["source_lon"],
+                run_stops,
+                trip["price_mt"]
+            )
+
+            dur = trip["trip_duration_min"]
+            cumul_shift += dur
+            if trip_num == 1:
+                d_dead, _ = l3.get_road_info(float(truck["parked_lat"]), float(truck["parked_lon"]), trip["source_lat"], trip["source_lon"])
+                cumul_shift += estimate_transit_time_min(d_dead)
+
+            delivery_plans.append({
+                "truck_id": truck["truck_id"],
+                "truck_type": truck["type"],
+                "capacity_lt": round(truck["capacity_lt"]),
+                "capacity_mt": round(truck["capacity_lt"] / l3.MT_TO_LITERS, 3),
+                "trip_number": trip_num,
+                "n_reloads": trip_num - 1,
+                "trip_duration_min": round(dur, 1),
+                "cumulative_shift_min": round(cumul_shift, 1),
+                "max_shift_min": ROUTE_WORK_DAY_MIN,
+                "solver": "Google OR-Tools (MD-CVRP + Multi-Trip)",
+                "initial_park": curr_pos["station"],
+                "initial_park_lat": curr_pos["lat"],
+                "initial_park_lon": curr_pos["lon"],
+                "source_id": trip["source_id"],
+                "source_name": trip["source_name"],
+                "source_lat": trip["source_lat"],
+                "source_lon": trip["source_lon"],
+                "pk_src_dist": costs["pk_src_dist"],
+                "pk_src_toll": costs["pk_src_toll"],
+                "total_lt": round(costs["total_deliver_lt"]),
+                "total_mt": round(costs["total_deliver_mt"], 3),
+                "total_load_lt": round(costs["total_deliver_lt"]),
+                "total_load_mt": round(costs["total_deliver_mt"], 3),
+                "stops": run_stops,
+                "journey_steps": journey_steps,
+                "last_delivery_stop": run_stops[-1]["station"] if run_stops else None,
+                "final_park": trip["source_name"],
+                "final_lat": trip["source_lat"],
+                "final_lon": trip["source_lon"],
+                "tot_purchase": round(costs["tot_purchase"], 2),
+                "tot_transport": round(costs["tot_transport"], 2),
+                "tot_toll": round(costs["tot_toll"], 2),
+                "grand_total": round(costs["grand_total"], 2),
+                "split_used": False,
+            })
+
+            # Subsequent trip begins at this terminal
+            curr_pos = {
+                "station": trip["source_name"],
+                "lat": trip["source_lat"],
+                "lon": trip["source_lon"]
+            }
+
+            truck_by_id[truck["truck_id"]]["parked_station"] = None
+            truck_by_id[truck["truck_id"]]["parked_source"] = trip["source_name"]
+            truck_by_id[truck["truck_id"]]["parked_source_id"] = trip["source_id"]
+            truck_by_id[truck["truck_id"]]["parked_label"] = trip["source_name"]
+            truck_by_id[truck["truck_id"]]["parked_lat"] = trip["source_lat"]
+            truck_by_id[truck["truck_id"]]["parked_lon"] = trip["source_lon"]
+            truck_by_id[truck["truck_id"]]["state"] = "atSource"
+
+    # Identify unserved stations if any
+    unserved = []
+    for st in needing:
+        if st["station"] not in covered_stations:
+            needed = round(float(st["needed_lt"]))
+            unserved.append({
+                "unserved_id": str(uuid.uuid4()),
+                "station": st["station"],
+                "needed_lt": needed,
+                "needed_mt": round(needed / l3.MT_TO_LITERS, 3),
+                "station_lat": st["station_lat"],
+                "station_lon": st["station_lon"],
+                "reason": "Fleet working hour or capacity limit reached",
+                "status": "UNSERVED"
+            })
+
+    used_ids = {plan["truck_id"] for plan in delivery_plans}
+    fleet_status = []
+    for truck in trucks:
+        t_plans = [p for p in delivery_plans if p["truck_id"] == truck["truck_id"]]
+        trips_count = len(t_plans)
+        max_shift = max((p.get("cumulative_shift_min", 0) for p in t_plans), default=0.0)
+        fleet_status.append({
+            "truck_id": truck["truck_id"],
+            "type": truck["type"],
+            "status": "DEPLOYED" if truck["truck_id"] in used_ids else "STANDBY",
+            "trips_count": trips_count,
+            "n_reloads": max(0, trips_count - 1),
+            "shift_duration_min": max_shift,
+            "initial_park": start_pos[truck["truck_id"]]["station"],
+            "final_park": truck.get("parked_label"),
+        })
+
+    return delivery_plans, fleet_status, trucks, unserved
+
+
+def build_plan_heuristic(stations, sources, trucks, avg_sales):
     needing = [s for s in stations if s["now"] == "NO" and s["needed_lt"] > 0]
     if not needing:
         return [], [], trucks, []
@@ -774,6 +1150,26 @@ def build_plan(stations, sources, trucks, avg_sales):
         )
 
     return delivery_plans, fleet_status, trucks, unserved
+
+
+def build_plan(stations, sources, trucks, avg_sales):
+    needing = [s for s in stations if s["now"] == "NO" and s["needed_lt"] > 0]
+    if not needing:
+        return [], [], trucks, []
+
+    if USE_OR_TOOLS and ORTOOLS_AVAILABLE:
+        try:
+            print("⚡ Executing Google OR-Tools Multi-Depot (MD-CVRP) & Multi-Trip Optimizer...")
+            ortools_res = build_plan_ortools(stations, sources, trucks, avg_sales)
+            if ortools_res is not None:
+                plans, status, trks, unserv = ortools_res
+                print(f"✓ OR-Tools Optimization succeeded: {len(plans)} delivery trips across {len(set(p['truck_id'] for p in plans))} deployed trucks.")
+                return plans, status, trks, unserv
+        except Exception as e:
+            print(f"⚠ OR-Tools solver encountered an exception ({e}); falling back to sequential heuristic.")
+
+    print("ℹ Executing sequential heuristic dispatch pipeline...")
+    return build_plan_heuristic(stations, sources, trucks, avg_sales)
 
 
 def build_cost_summary(delivery_plans):
@@ -1091,6 +1487,11 @@ def write_plan(db, delivery_plans, fleet_status, trucks, unserved, stations_df, 
             "fleet_status": fleet_status,
             "meta": {
                 "rules": {
+                    "solver": "Google OR-Tools (MD-CVRP + Multi-Trip)" if (USE_OR_TOOLS and ORTOOLS_AVAILABLE) else "Sequential Heuristic",
+                    "multi_trip_enabled": True,
+                    "work_day_min": int(ROUTE_WORK_DAY_MIN),
+                    "load_min_at_source": int(ROUTE_LOAD_MIN_AT_SOURCE),
+                    "unload_min_per_stop": int(ROUTE_UNLOAD_MIN_PER_STOP),
                     "max_stops_per_truck": int(l3.MAX_STOPS_PER_TRUCK),
                     "max_grouping_km": float(l3.MAX_GROUPING_KM),
                     "no_refueling": True,

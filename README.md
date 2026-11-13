@@ -122,14 +122,14 @@ The forecasting engine (`pythonLogic/predict_demand.py`) provides daily sales fo
 
 ---
 
-## 🚀 Future Enhancement Roadmap
+## 🚀 Optimization Engines & Enhancement Roadmap
 
-| Area | Current Implementation | Limitation | Recommended Future Enhancement |
+| Area | Production Implementation | Architecture & Operational Characteristics | Roadmap Scaling Strategy |
 | :--- | :--- | :--- | :--- |
-| **Optimization algorithm** | Sequential heuristic-based approach: source selection → station grouping → truck allocation | Sequential decisions may produce locally optimal but globally suboptimal dispatch plans. | Integrate **Google OR-Tools** to formulate a **Multi-Depot Capacitated Vehicle Routing Problem (MD-CVRP)**, performing joint route and fleet optimization considering source selection, truck capacity, demand, and transportation cost. |
+| **Optimization algorithm** | **Integrated:** Google OR-Tools Multi-Depot (MD-CVRP) joint solver (with sequential heuristic fallback) | Jointly optimizes candidate supply terminal sourcing, 12MT/7MT vehicle capacity limits, and landed transit costs in the primary dispatch pipeline (`route_plan_db.py`). | Scale constraints with custom time-window scheduling (VRPTW) and dynamic pickup-and-delivery pairs. |
 | **Commercial vehicle routing** | Google Routes API using `DRIVE` mode | Standard driving routes may not account for all LPG tanker restrictions, such as hazardous-material restrictions, vehicle dimensions, and weight limits. | Introduce commercial vehicle routing constraints using validated road restriction data and suitable **Heavy Goods Vehicle (HGV)** routing profiles. |
 | **Routing API scalability** | Google Routes API with route caching and distance fallback | Large-scale route matrix calculations may increase API costs, latency, and quota consumption. | Integrate self-hosted **OSRM** for scalable road-distance matrix calculations, retaining Google Routes as an alternative provider. |
-| **Multi-trip scheduling** | One delivery run per truck per planning execution | Trucks returning early cannot be reassigned for another delivery within the same planning run. | Implement **Multi-Trip Vehicle Routing (MT-VRP)** to maximize truck utilization within working-hour and loading constraints. |
+| **Multi-trip scheduling** | **Integrated:** Multi-Trip Vehicle Routing (MT-VRP) with shift constraints | Evaluates terminal loading (45 min), station unloading (30 min per stop), and road travel times against an 8-hour shift (`ROUTE_WORK_DAY_MIN = 480`). Reassigns vehicles returning from local runs for secondary trips (`trip_number = 2`, `n_reloads = 1`). | Dynamic multi-day driver rest-break regulations and split-shift driver handovers. |
 | **Toll calculation** | Google Routes toll information where available, with distance-based estimated fallback | Estimated toll values may differ from actual toll charges and vehicle-specific tariffs. | Integrate verified toll-plaza information (NHAI TIS) or **TollGuru API** for more accurate route-wise toll estimation. |
 | **Traffic integration** | Separate SUMO traffic simulation using the BPR congestion model | Simulated congestion does not directly influence the actual dispatch route assignment. | Integrate traffic-adjusted travel-time estimates into the route optimization and delivery scheduling process. |
 | **Demand forecasting** | Random Forest Regressor with lag and rolling statistical features | Performance may be affected by seasonal changes, price fluctuations, and external demand factors. | Evaluate **XGBoost** and **LightGBM** with additional calendar, seasonal, and external features. |
@@ -138,10 +138,10 @@ The forecasting engine (`pythonLogic/predict_demand.py`) provides daily sales fo
 
 ## 💡 Architectural Distinction for Technical Reviews
 
-* **Current Implementation (Working Platform):**
-  Random Forest Regressor + Sequential Heuristic Optimization (Landed-Cost + Balanced Partitioning) + Haversine (1.3x) Fallback + Google Routes API v2 + MongoDB Atlas + Node.js/Express + React/Vite.
-* **Future Enhancements (Scale Architecture):**
-  Google OR-Tools (MD-CVRP joint optimization) + Commercial HGV routing profiles + Multi-Trip Vehicle Routing (MT-VRP) + Self-hosted OSRM matrix computation + Real-time traffic travel-time adjustments + Gradient-boosted forecasting (XGBoost/LightGBM).
+* **Production Architecture (Implemented in Repo):**
+  **Google OR-Tools MD-CVRP Engine** + **Multi-Trip Vehicle Routing (MT-VRP)** + **Sequential Heuristic Fallback** + **Random Forest Demand Regressor** + **Google Routes API v2** + **Haversine ($1.3\times$) Circuity Fallback** + **MongoDB Atlas** + **Node.js/Express** + **React/Vite Dashboard**.
+* **Scale Enhancements (Next Phase Architecture):**
+  Commercial hazmat tanker routing profiles + Self-hosted OSRM matrix scaling + Dedicated NHAI TIS / TollGuru toll integration + Real-time traffic ingestion into solver.
 
 ---
 

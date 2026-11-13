@@ -273,38 +273,39 @@ def calculate_nhai_fastag_toll(dist_km, truck_type="12MT", is_return_trip=True):
 def get_road_info(olat, olon, dlat, dlon, truck_type="12MT"):
     key = _rkey(olat, olon, dlat, dlon)
     if key in _route_cache: return _route_cache[key]
-    try:
-        resp = requests.post(
-            "https://routes.googleapis.com/directions/v2:computeRoutes",
-            headers={"Content-Type":"application/json","X-Goog-Api-Key":GOOGLE_API_KEY,
-                     "X-Goog-FieldMask":"routes.distanceMeters,routes.duration,"
-                                         "routes.travelAdvisory.tollInfo,routes.description"},
-            json={"origin":{"location":{"latLng":{"latitude":olat,"longitude":olon}}},
-                  "destination":{"location":{"latLng":{"latitude":dlat,"longitude":dlon}}},
-                  "travelMode":"DRIVE","computeAlternativeRoutes":True,
-                  "extraComputations":["TOLLS"],
-                  "routeModifiers":{"vehicleInfo":{"emissionType":"DIESEL"}}},
-            timeout=15)
-        data = resp.json()
-        if "routes" in data and data["routes"]:
-            def rs(r):
-                dist = r["distanceMeters"]/1000
-                toll = sum(float(p.get("units",0))+float(p.get("nanos",0))/1e9
-                           for p in r.get("travelAdvisory",{}).get("tollInfo",{}).get("estimatedPrice",[]))
-                return dist + toll*50
-            best    = min(data["routes"], key=rs)
-            dist_km = best["distanceMeters"]/1000.0
-            toll    = sum(float(p.get("units",0))+float(p.get("nanos",0))/1e9
-                         for p in best.get("travelAdvisory",{}).get("tollInfo",{}).get("estimatedPrice",[]))
-            
-            # If Google API returns toll data, use it; otherwise compute exact NHAI FASTag toll
-            if toll <= 0:
-                toll = calculate_nhai_fastag_toll(dist_km, truck_type=truck_type, is_return_trip=True)
+    if GOOGLE_API_KEY:
+        try:
+            resp = requests.post(
+                "https://routes.googleapis.com/directions/v2:computeRoutes",
+                headers={"Content-Type":"application/json","X-Goog-Api-Key":GOOGLE_API_KEY,
+                         "X-Goog-FieldMask":"routes.distanceMeters,routes.duration,"
+                                             "routes.travelAdvisory.tollInfo,routes.description"},
+                json={"origin":{"location":{"latLng":{"latitude":olat,"longitude":olon}}},
+                      "destination":{"location":{"latLng":{"latitude":dlat,"longitude":dlon}}},
+                      "travelMode":"DRIVE","computeAlternativeRoutes":True,
+                      "extraComputations":["TOLLS"],
+                      "routeModifiers":{"vehicleInfo":{"emissionType":"DIESEL"}}},
+                timeout=15)
+            data = resp.json()
+            if "routes" in data and data["routes"]:
+                def rs(r):
+                    dist = r["distanceMeters"]/1000
+                    toll = sum(float(p.get("units",0))+float(p.get("nanos",0))/1e9
+                               for p in r.get("travelAdvisory",{}).get("tollInfo",{}).get("estimatedPrice",[]))
+                    return dist + toll*50
+                best    = min(data["routes"], key=rs)
+                dist_km = best["distanceMeters"]/1000.0
+                toll    = sum(float(p.get("units",0))+float(p.get("nanos",0))/1e9
+                             for p in best.get("travelAdvisory",{}).get("tollInfo",{}).get("estimatedPrice",[]))
                 
-            _route_cache[key] = (round(dist_km,1), round(toll,2))
-            return round(dist_km,1), round(toll,2)
-    except Exception:
-        pass
+                # If Google API returns toll data, use it; otherwise compute exact NHAI FASTag toll
+                if toll <= 0:
+                    toll = calculate_nhai_fastag_toll(dist_km, truck_type=truck_type, is_return_trip=True)
+                    
+                _route_cache[key] = (round(dist_km,1), round(toll,2))
+                return round(dist_km,1), round(toll,2)
+        except Exception:
+            pass
     dist = round(haversine(olat,olon,dlat,dlon)*1.3, 1)
     toll = calculate_nhai_fastag_toll(dist, truck_type=truck_type, is_return_trip=True)
     _route_cache[key] = (dist, toll)
