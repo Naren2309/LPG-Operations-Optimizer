@@ -1,179 +1,259 @@
-# Operations Optimization - Fuel Company
+# LPG Operations Optimizer - Enterprise Auto-Dispatch & Supply Chain Optimization Platform
 
-This project provides a basic full-stack setup for fuel operations optimization:
-- `backend`: Node.js + Express + MongoDB (Mongoose)
-- `frontend`: React (Vite)
-- `database`: MongoDB collections `user`, `source`, `station`, and `truck`
-- `data source`: Excel files in `pythonLogic/` (preferred) or `data/` (fallback)
+An end-to-end, full-stack operational platform designed to automate fuel replenishment, reduce procurement and transport freight costs, and forecast daily station consumption for retail Auto LPG networks.
 
-## Collections and Schema
+---
 
-### `user` collection
-- `username` (String, unique via normalized)
-- `username_normalized` (String, unique)
-- `name` (String)
-- `type` (String: `admin` or `station_manager`)
-- `password_hash` (String, bcrypt)
+## 📌 System Architecture & Core Pillars
 
-### `source` collection
-Derived from `pythonLogic/sources.xlsx` (or `data/sources.xlsx` fallback):
-- `source_id` (String, unique)
-- `source_name` (String)
-- `coordinates.lat` (Number)
-- `coordinates.lng` (Number)
-- `price_per_mt_ex_terminal` (Number)
+The platform is architected around three foundational pillars:
+1. **Automated Stock Monitoring & Depletion Detection:** Real-time ingestion of IoT Automatic Tank Gauge (ATG) telemetry to instantly identify critically depleted stations.
+2. **Multi-Terminal Landed-Cost Route Optimization:** Dynamic sourcing and vehicle routing solver that evaluates refinery prices, RTKM transport tariffs, and NHAI FASTag tolls across candidate terminals.
+3. **Machine Learning Demand Forecasting:** Enterprise chronological time-series forecasting across network stations to optimize buffer inventory and replenishment quantities.
 
-### `station` collection
-Derived from `pythonLogic/clean_stationss.xlsx` (or `data/clean_stationss.xlsx` fallback):
-- `station` (String, unique)
-- `coordinates.lat` (Number)
-- `coordinates.lng` (Number)
-- `capacity_in_lt` (Number)
-- `dead_stock_in_lt` (Number)
-- `usable_lt` (Number)
-- `sufficient_fuel` (String: `YES` or `NO`)
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                 CORE OPERATIONAL WORKFLOW                                   │
+│                                                                                             │
+│  [ IoT ATG Sensor / ] ──> [ Stock Depletion ] ──> [ Landed-Cost ] ──> [ Balanced Partition ]│
+│  [ Dipstick Portal  ]     [ Threshold (60%) ]     [ Terminal Opt]     [ Clustering (≤80km) ]│
+│                                                          │                                  │
+│                                                          ▼                                  │
+│  [ Stock Credited & ] <── [ Driver Portal & ] <── [ Fleet Capacity] <── [ Proportional     ]│
+│  [ Cycle Closure    ]     [ Manifest Export ]     [ Allocation    ]     [ Fairness Split    ]│
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
 
-### `truck` collection
-Derived from `pythonLogic/truck_positions.json`:
-- `truck_id` (String, unique)
-- `station` (String)
-- `lat` (Number)
-- `lon` (Number)
-- `type` (String)
+---
 
-## Prerequisites
+## 🗺️ System Flow Diagram
 
-- Node.js 18+
-- npm
-- MongoDB Atlas/local MongoDB URI in `.env`
+The complete end-to-end replenishment lifecycle is illustrated below:
 
-Routing env knobs:
-- `ROUTE_MAX_STOPS_PER_TRUCK`: max stations per truck run (default `2`).
-- `ROUTE_MAX_GROUPING_KM`: grouping radius used when clustering stops (default `80`).
-- `ROUTE_SPLIT_LOOKBACK_MONTHS`: sales split lookback window in months (`1` = previous month).
-- `ROUTE_SOURCE_ASSIGNMENT_WORKERS`: parallel workers for source-cost assignment (default `4`).
+![KR Fuels Stock-to-Dispatch Workflow](frontend/assets/low_fuel_workflow_flowchart.png)
 
-## Setup
+---
 
-Install backend dependencies:
+## 📏 Distance Calculation & Routing Engine
 
+Accurate road distance and transit cost metrics are fundamental to operational cost minimization. The system implements a two-tier hybrid architecture with in-memory memoization:
+
+### 1. Live Road Routing: Google Routes API v2
+* **Endpoint:** `https://routes.googleapis.com/directions/v2:computeRoutes`
+* **Commercial Vehicle Profile:** Configured with `travelMode: "DRIVE"` and `emissionType: "DIESEL"` for heavy commercial tankers.
+* **Toll Evaluation:** Ingests `travelAdvisory.tollInfo` to calculate real-world FASTag toll expenses per corridor.
+* **Route Selection Criterion:** When multiple route alternatives exist, the solver selects the route that minimizes:
+  $$\text{Composite Score} = \text{Distance (km)} + (\text{Toll in ₹} \times 50)$$
+  This objective function dynamically balances highway speed and distance against toll road expenses.
+
+### 2. Offline / Matrix Fallback: Haversine with Circuity Multiplier
+When running offline (`USE_LIVE_ROUTES=0`), during rapid pre-filtering, or when external API limits are reached, the system computes spherical great-circle distances:
+$$d_{\text{great-circle}} = 2 R \arcsin\left(\sqrt{\sin^2\left(\frac{\Delta\phi}{2}\right) + \cos\phi_1\cos\phi_2\sin^2\left(\frac{\Delta\lambda}{2}\right)}\right) \quad (R = 6,371\text{ km})$$
+
+* **Road Curvature Factor ($\times 1.3$):** Because straight-line distance underestimates actual highway routes, a standardized $1.3\times$ multiplier is applied:
+  $$\text{Road Distance} \approx d_{\text{great-circle}} \times 1.3$$
+
+### 3. NHAI FASTag Commercial Tanker Toll Formulation
+When live toll data is unavailable, toll charges are evaluated using a deterministic NHAI Fastag commercial vehicle pricing model (`calculate_nhai_fastag_toll`):
+* Trips under $35\text{ km}$ are classified as intra-city (zero national highway tolls).
+* For trips $\ge 35\text{ km}$, toll plazas occur approximately every $55\text{ km}$:
+  $$\text{Plazas} = \max\left(1, \left\lfloor\frac{\text{Distance}}{55}\right\rfloor\right)$$
+* **Axle-based tariffs:**
+  * **12MT 3-Axle Heavy Tankers:** ₹165 per plaza.
+  * **7MT 2-Axle Commercial Tankers:** ₹115 per plaza.
+* **FASTag 24-Hour Return Discount:** A 50% discount is applied to the return leg ($1.5\times$ single toll for a round trip).
+
+### 4. Coordinate Memoization Cache
+To eliminate redundant HTTP requests and prevent API quota exhaustion, computed legs are cached in `_route_cache` using coordinate keys rounded to four decimal places:
+$$\text{Key} = (\text{round}(\text{lat}_1, 4), \text{round}(\text{lon}_1, 4), \text{round}(\text{lat}_2, 4), \text{round}(\text{lon}_2, 4))$$
+
+---
+
+## ⚙️ Operations Optimization Pipeline
+
+The dispatch solver (`pythonLogic/route_plan_db.py` & `pythonLogic/logic3.py`) executes a sequential heuristic optimization pipeline:
+
+### Step 1: Depletion Assessment
+A retail station requires replenishment when:
+$$\text{Dead Stock (L)} \ge 60\% \times \text{Capacity (L)} \quad \text{or} \quad \text{sufficient\_fuel} == \text{"NO"}$$
+$$\text{Needed Quantity (MT)} = \frac{\text{Usable Capacity (L)}}{1,810\text{ L/MT}}$$
+
+### Step 2: Multi-Terminal Landed-Cost Minimization
+For every station requiring fuel, candidate supply terminals (e.g., CPCL Manali, IOCL Ennore, BPCL Chennai) are evaluated to find the terminal that minimizes total landed cost:
+$$\min_{s \in \text{Sources}} \Big( \text{Terminal Purchase Price}_s + \text{RTKM Freight Cost}(s, \text{station}) + \text{FASTag Tolls} \Big)$$
+
+#### Monotonic Freight Tariff Floor Rule:
+Standard freight contracts charge flat rates for local runs and per-kilometer rates for long hauls. To eliminate the 100 km "tariff cliff edge" where routes slightly above 100 km could become cheaper than shorter journeys, the freight calculation enforces a monotonic floor:
+$$\text{Freight Tariff} = \begin{cases} ₹1,750 \times \text{MT} & \text{if } \text{dist} \le 100\text{ km} \\ \max(₹1,750 \times \text{MT},\; ₹6.8 \times \text{MT} \times \text{dist} \times 2) & \text{if } \text{dist} > 100\text{ km} \end{cases}$$
+
+### Step 3: Geographic Clustering & Balanced Partitioning
+Stations assigned to the same source terminal are sorted by distance from the terminal and partitioned into multi-stop runs using `balanced_partition()`:
+* **Maximum stops per tanker run:** 2 stations (`ROUTE_MAX_STOPS_PER_TRUCK = 2`).
+* **Maximum inter-station grouping distance:** 80 km (`ROUTE_MAX_GROUPING_KM = 80`).
+* Partitions avoid isolated single stops whenever nearby stations can be consolidated into a combined delivery leg.
+
+### Step 4: Fleet Matching & Capacity Feasibility
+The fleet consists of 30 specialized bullet tankers:
+* **23 $\times$ 12MT Tankers** (Capacity: 21,720 Liters / 12 MT)
+* **7 $\times$ 7MT Tankers** (Capacity: 12,670 Liters / 7 MT)
+
+The solver selects the nearest available vehicle whose capacity satisfies the combined demand. If no single tanker can satisfy the combined demand, the largest available tanker is assigned to deliver maximum volume.
+
+### Step 5: Demand-Weighted Proportional Split
+When the combined demand of a 2-stop run exceeds tanker capacity, capacity is split based on 30-day historical average sales volume (`avg_sales`):
+$$\text{Allocated Share}_i = \frac{\text{avg\_sales}_i}{\sum_{j} \text{avg\_sales}_j} \times \text{Truck Capacity}$$
+* A minimum delivery threshold of $1\text{ MT}$ ($1,810\text{ L}$) per stop is enforced.
+* Any remaining unmet demand is logged in the `unservedStations` collection with root-cause categorization.
+
+### Step 6: Zero-Deadhead Parking Strategy
+At trip conclusion, tankers park at the terminal rather than the last delivery station:
+* Subsequent dispatch cycles originate directly from the supply terminal.
+* Eliminates empty deadhead travel on the first leg of subsequent runs.
+
+---
+
+## 📈 Machine Learning Demand Forecasting
+
+The forecasting engine (`pythonLogic/predict_demand.py`) provides daily sales forecasts across 81 network stations:
+* **Chronological Split:** Strict 80/20 chronological train/test split preventing future lookahead leakage.
+* **Feature Engineering:** Lagged sales ($t-1, t-7$), 7-day rolling mean, 7-day rolling standard deviation, and day-of-week indicators.
+* **Model Benchmark:** Random Forest Regressor benchmarked against a baseline Moving Average model.
+* **Scenario Projections:** Computes Base, Low (5th percentile), and High (95th percentile) demand scenarios for safety stock buffer sizing.
+
+---
+
+## 🚀 Future Enhancement Roadmap
+
+| Area | Current Implementation | Limitation | Recommended Future Enhancement |
+| :--- | :--- | :--- | :--- |
+| **Optimization algorithm** | Sequential heuristic-based approach: source selection → station grouping → truck allocation | Sequential decisions may produce locally optimal but globally suboptimal dispatch plans. | Integrate **Google OR-Tools** to formulate a **Multi-Depot Capacitated Vehicle Routing Problem (MD-CVRP)**, performing joint route and fleet optimization considering source selection, truck capacity, demand, and transportation cost. |
+| **Commercial vehicle routing** | Google Routes API using `DRIVE` mode | Standard driving routes may not account for all LPG tanker restrictions, such as hazardous-material restrictions, vehicle dimensions, and weight limits. | Introduce commercial vehicle routing constraints using validated road restriction data and suitable **Heavy Goods Vehicle (HGV)** routing profiles. |
+| **Routing API scalability** | Google Routes API with route caching and distance fallback | Large-scale route matrix calculations may increase API costs, latency, and quota consumption. | Integrate self-hosted **OSRM** for scalable road-distance matrix calculations, retaining Google Routes as an alternative provider. |
+| **Multi-trip scheduling** | One delivery run per truck per planning execution | Trucks returning early cannot be reassigned for another delivery within the same planning run. | Implement **Multi-Trip Vehicle Routing (MT-VRP)** to maximize truck utilization within working-hour and loading constraints. |
+| **Toll calculation** | Google Routes toll information where available, with distance-based estimated fallback | Estimated toll values may differ from actual toll charges and vehicle-specific tariffs. | Integrate verified toll-plaza information (NHAI TIS) or **TollGuru API** for more accurate route-wise toll estimation. |
+| **Traffic integration** | Separate SUMO traffic simulation using the BPR congestion model | Simulated congestion does not directly influence the actual dispatch route assignment. | Integrate traffic-adjusted travel-time estimates into the route optimization and delivery scheduling process. |
+| **Demand forecasting** | Random Forest Regressor with lag and rolling statistical features | Performance may be affected by seasonal changes, price fluctuations, and external demand factors. | Evaluate **XGBoost** and **LightGBM** with additional calendar, seasonal, and external features. |
+
+---
+
+## 💡 Architectural Distinction for Technical Reviews
+
+* **Current Implementation (Working Platform):**
+  Random Forest Regressor + Sequential Heuristic Optimization (Landed-Cost + Balanced Partitioning) + Haversine (1.3x) Fallback + Google Routes API v2 + MongoDB Atlas + Node.js/Express + React/Vite.
+* **Future Enhancements (Scale Architecture):**
+  Google OR-Tools (MD-CVRP joint optimization) + Commercial HGV routing profiles + Multi-Trip Vehicle Routing (MT-VRP) + Self-hosted OSRM matrix computation + Real-time traffic travel-time adjustments + Gradient-boosted forecasting (XGBoost/LightGBM).
+
+---
+
+## 🛠️ Tech Stack & Directory Structure
+
+* **Backend:** Node.js, Express, MongoDB (Mongoose), JWT, Bcrypt
+* **Frontend:** React, Vite, Tailwind CSS, Lucide Icons
+* **Optimization & Data Science:** Python 3, Pandas, Scikit-learn, Requests, OpenPyXL, Matplotlib
+
+```
+LPG-Operations-Optimizer/
+├── backend/
+│   ├── src/
+│   │   ├── models/           # Mongoose schemas (user, source, station, truck, delivery, etc.)
+│   │   ├── routes/           # REST endpoints (auth, data, automation, manager, shared)
+│   │   ├── services/         # Background sync, news scrapers, and terminal price services
+│   │   └── index.js          # Express app entry point
+│   └── package.json
+├── frontend/
+│   ├── assets/               # Branding assets and system workflow flowchart diagram
+│   ├── src/                  # React dashboard, driver portal, manager views, and reports
+│   └── package.json
+├── pythonLogic/
+│   ├── logic3.py             # Core heuristic routing, toll logic, and Excel workbook generator
+│   ├── route_plan_db.py      # Database-driven dispatch engine (invoked by backend)
+│   ├── predict_demand.py     # Machine Learning demand forecasting pipeline (Random Forest)
+│   ├── sumo_traffic_sim.py   # BPR highway congestion simulation module
+│   ├── generate_flowchart_image.py # System architecture flowchart generator
+│   └── requirements.txt      # Python dependencies
+├── data/                     # Seed datasets (clean_stationss.xlsx, sources.xlsx, sales_data.xlsx)
+└── README.md
+```
+
+---
+
+## ⚡ Prerequisites & Environment Variables
+
+* **Node.js:** 18.x or later
+* **Python:** 3.10+ with `pip`
+* **MongoDB:** Local instance or MongoDB Atlas cluster
+
+### Routing Environment Knobs (`.env`):
+```env
+MONGO_URI=mongodb://localhost:27017/operations_optimization
+DB_NAME=operations_optimization
+GOOGLE_API_KEY=your_google_routes_api_key_here
+USE_LIVE_ROUTES=1
+ROUTE_MAX_STOPS_PER_TRUCK=2
+ROUTE_MAX_GROUPING_KM=80
+ROUTE_SPLIT_LOOKBACK_MONTHS=1
+ROUTE_SOURCE_ASSIGNMENT_WORKERS=4
+PYTHON_PATH=python
+```
+
+---
+
+## 🚀 Getting Started
+
+### 1. Install Backend Dependencies
 ```bash
 cd backend
 npm install
 ```
 
-Install frontend dependencies:
-
+### 2. Install Frontend Dependencies
 ```bash
 cd frontend
 npm install
 ```
 
-## Import Excel Data into MongoDB
-
-From `backend` folder:
-
-```bash
-npm run import-data
-```
-
-This reads:
-- `pythonLogic/sources.xlsx` (fallback: `data/sources.xlsx`)
-- `pythonLogic/clean_stationss.xlsx` (fallback: `data/clean_stationss.xlsx`)
-- `pythonLogic/truck_positions.json`
-
-## Route Planning (Python)
-
-Install Python requirements:
-
+### 3. Install Python Dependencies
 ```bash
 pip install -r pythonLogic/requirements.txt
 ```
 
-Optional environment variable for the python executable:
-
-```env
-PYTHON_PATH=python
+### 4. Seed Data into MongoDB
+From the `backend/` directory:
+```bash
+npm run import-data
 ```
+This reads `sources.xlsx`, `clean_stationss.xlsx`, and `truck_positions.json` and populates the database collections.
 
-The admin dashboard triggers the planner via `POST /api/route-plan`, which
-writes suggested outputs into MongoDB collections:
-- `delivery`
-- `truckPlanning`
-- `tentativeCost`
-
-Planner script: `pythonLogic/route_plan_db.py`.
-
-and upserts records into `source` and `station`.
-
-## Run Backend
-
+### 5. Run Backend Server
 ```bash
 cd backend
 npm run dev
 ```
+Backend runs on `http://localhost:5000`.
 
-Backend runs on `http://localhost:5000` by default.
-
-API endpoints:
-- `GET /health`
-- `POST /api/auth/login`
-- `POST /api/users/station-managers` (admin JWT required)
-- `GET /api/sources` (admin JWT required)
-- `GET /api/stations` (admin JWT required)
-- `GET /api/trucks` (admin JWT required)
-- `POST /api/import` (admin JWT required)
-- `POST /api/route-plan` (admin JWT required)
-- `GET /api/route-plan/latest` (admin JWT required)
-
-## Run Frontend
-
+### 6. Run Frontend Application
 ```bash
 cd frontend
 npm run dev
 ```
+Frontend runs on `http://localhost:5173`.
 
-Frontend runs on Vite default port (`http://localhost:5173`).
+---
 
-Optional API URL override:
+## 🔐 Authentication & Roles
 
-```env
-VITE_API_URL=http://localhost:5000/api
-```
+* **Admin Role:** Full access to route optimization, data import, analytics dashboard, fleet management, and driver dispatch logs.
+* **Station Manager Role:** Access to individual station fuel telemetry, manual dipstick reading logging, and local delivery status.
 
-## Authentication
-
-The frontend uses JWT tokens for login. Users are stored in MongoDB with
-hashed passwords. Data endpoints are admin-only. On backend start, an admin
-user is created if one does not exist (using `ADMIN_EMAIL` and
-`ADMIN_PASSWORD`).
-
-Login example:
-
+Default admin credentials initialized on startup:
 ```json
-POST /api/auth/login
 {
   "username": "admin@krfuels.com",
   "password": "Admin@123"
 }
 ```
 
-Create station manager (admin only):
+---
 
-```json
-POST /api/users/station-managers
-{
-  "name": "Station Manager",
-  "username": "manager@krfuels.com",
-  "password": "Manager@123",
-  "station": "Anna Nagar"
-}
-```
-
-Station manager demo accounts are auto-seeded for each station (with plaintext
-passwords stored in the `user` collection for easy viewing in MongoDB).
-
-## Notes
-
-- The importer handles trailing spaces in Excel column names (`Source_ID ` and `Stations `).
-- Coordinates are parsed from a comma-separated string into `{ lat, lng }`.
+## 📄 License
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
